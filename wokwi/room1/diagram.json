@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "author": "CoCIS Smart Control System",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "room1", "top": 130, "left": 120, "attrs": {} },
+    { "type": "wokwi-pir-motion-sensor", "id": "pir1", "top": 80, "left": 390, "attrs": {} },
+    { "type": "wokwi-led", "id": "light1", "top": 300, "left": 390, "attrs": { "color": "yellow", "label": "ROOM 1 LIGHT" } }
+  ],
+  "connections": [
+    [ "room1:34", "pir1:OUT", "orange", [] ], [ "pir1:VCC", "room1:3V3", "red", [] ],
+    [ "pir1:GND", "room1:GND.1", "black", [] ], [ "room1:32", "light1:A", "gold", [] ],
+    [ "light1:C", "room1:GND.1", "black", [] ]
+  ],
+  "dependencies": {}
+}

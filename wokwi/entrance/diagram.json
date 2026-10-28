@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "author": "CoCIS Smart Control System",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "entrance", "top": 120, "left": 120, "attrs": {} },
+    { "type": "wokwi-microsd-card", "id": "sd", "top": 160, "left": 430, "attrs": {} },
+    { "type": "wokwi-led", "id": "doorIn", "top": 40, "left": 80, "attrs": { "color": "green", "label": "ENTRY" } },
+    { "type": "wokwi-led", "id": "doorOut", "top": 40, "left": 150, "attrs": { "color": "lime", "label": "EXIT" } },
+    { "type": "wokwi-led", "id": "alarmLed", "top": 40, "left": 220, "attrs": { "color": "red", "label": "ALARM" } },
+    { "type": "wokwi-buzzer", "id": "buzzer", "top": 40, "left": 300, "attrs": { "volume": "0.1" } }
+  ],
+  "connections": [
+    [ "entrance:25", "doorIn:A", "green", [] ], [ "doorIn:C", "entrance:GND.1", "black", [] ],
+    [ "entrance:26", "doorOut:A", "green", [] ], [ "doorOut:C", "entrance:GND.1", "black", [] ],
+    [ "entrance:27", "alarmLed:A", "red", [] ], [ "alarmLed:C", "entrance:GND.1", "black", [] ],
+    [ "entrance:14", "buzzer:2", "blue", [] ], [ "buzzer:1", "entrance:GND.1", "black", [] ],
+    [ "entrance:5", "sd:CS", "purple", [] ], [ "entrance:23", "sd:DI", "purple", [] ],
+    [ "entrance:19", "sd:DO", "purple", [] ], [ "entrance:18", "sd:SCK", "purple", [] ],
+    [ "sd:VCC", "entrance:3V3", "red", [] ], [ "sd:GND", "entrance:GND.1", "black", [] ]
+  ],
+  "dependencies": {}
+}

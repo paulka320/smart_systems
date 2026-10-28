@@ -1,0 +1,74 @@
+{ 
+  "author": "Group 11",
+  "version": 1,
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp1", "top": 190, "left": 150, "attrs": {} },
+    { "type": "wokwi-microsd-card", "id": "sd1", "top": 210, "left": 400, "attrs": {} },
+    {
+      "type": "wokwi-led",
+      "id": "ledIn1",
+      "top": 60,
+      "left": 90,
+      "attrs": { "color": "green", "label": "Door IN" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledOut1",
+      "top": 60,
+      "left": 150,
+      "attrs": { "color": "lime", "label": "Door OUT" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledRed1",
+      "top": 60,
+      "left": 210,
+      "attrs": { "color": "red", "label": "Denied/Alarm" }
+    },
+    { "type": "wokwi-buzzer", "id": "bz1", "top": 60, "left": 280, "attrs": { "volume": "0.1" } },
+    { "type": "wokwi-pir-motion-sensor", "id": "pir1", "top": 370, "left": 10, "attrs": {} },
+    { "type": "wokwi-pir-motion-sensor", "id": "pir2", "top": 370, "left": 170, "attrs": {} },
+    {
+      "type": "wokwi-led",
+      "id": "ledR1",
+      "top": 390,
+      "left": 330,
+      "attrs": { "color": "yellow", "label": "Room1 Light" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "ledR2",
+      "top": 390,
+      "left": 400,
+      "attrs": { "color": "orange", "label": "Room2 Light" }
+    }
+  ],
+  "connections": [
+    [ "esp1:25", "ledIn1:A", "green", [] ],
+    [ "ledIn1:C", "esp1:GND.1", "black", [] ],
+    [ "esp1:26", "ledOut1:A", "green", [] ],
+    [ "ledOut1:C", "esp1:GND.1", "black", [] ],
+    [ "esp1:27", "ledRed1:A", "red", [] ],
+    [ "ledRed1:C", "esp1:GND.1", "black", [] ],
+    [ "esp1:14", "bz1:2", "blue", [] ],
+    [ "bz1:1", "esp1:GND.1", "black", [] ],
+    [ "esp1:34", "pir1:OUT", "orange", [] ],
+    [ "pir1:VCC", "esp1:3V3", "red", [] ],
+    [ "pir1:GND", "esp1:GND.1", "black", [] ],
+    [ "esp1:35", "pir2:OUT", "orange", [] ],
+    [ "pir2:VCC", "esp1:3V3", "red", [] ],
+    [ "pir2:GND", "esp1:GND.1", "black", [] ],
+    [ "esp1:32", "ledR1:A", "gold", [] ],
+    [ "ledR1:C", "esp1:GND.1", "black", [] ],
+    [ "esp1:33", "ledR2:A", "gold", [] ],
+    [ "ledR2:C", "esp1:GND.1", "black", [] ],
+    [ "esp1:5", "sd1:CS", "purple", [] ],
+    [ "esp1:23", "sd1:DI", "purple", [] ],
+    [ "esp1:19", "sd1:DO", "purple", [] ],
+    [ "esp1:18", "sd1:SCK", "purple", [] ],
+    [ "sd1:VCC", "esp1:3V3", "red", [] ],
+    [ "sd1:GND", "esp1:GND.1", "black", [] ]
+  ],
+  "dependencies": {}
+}
