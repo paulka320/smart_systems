@@ -87,3 +87,42 @@ Useful entrance commands include `help`, `status`, `scan in A1B2C3D4`,
 `scan out A1B2C3D4`, and `login 1234`. After login, use commands such as
 `clearinside` (only after confirming the building is empty),
 `schedule 07:00 22:00`, `settime 06:55`, and `passwd <new-pin>`.
+
+## Room-level presence and counting (room readers)
+
+Room presence is tracked per badge. A user who scans `scan roomN in <UID>` while
+already inside the building is marked as present in room N; `scan roomN out <UID>`
+clears it. Moving to another room auto-leaves the previous one and logs
+`ROOM_MOVE`. Leaving the building while badged into a room auto-logs
+`ROOM_OUT "auto: left building"`. Presence is set by badges only — it does NOT
+expire after the 20 s light idle timeout, and lights keep following the PIR
+independently.
+
+Counts are computed on demand (`room_count(room)` = number of users whose
+`current_room` equals that room); there is no separate counter that can drift.
+Count only badged people — motion alone never increments a room count.
+
+Counts appear in `rooms` (`Room1: 3 inside (Alice, Bob, Carol) | cap 30 | peak 3 |
+PIR: motion | light ON`), `status` (`Room1: 3 badged`), `who` (`Alice (Room1)`),
+`users` (trailing `RoomN` / `-`), and `count`
+(`Building: X inside / Y registered | Room1: a | Room2: b | not in a room: c`).
+Log lines `ROOM_IN`, `ROOM_OUT`, `ROOM_MOVE` carry the new count, e.g.
+`Room1 count=3` and `Room1 count=2 -> Room2 count=1`.
+
+Capacity: `maxocc <room> <n>` (admin, default 30, range 1..MAX_USERS) limits
+concurrent badge-ins. At capacity, `scan roomN in` is denied `ROOM_DENIED
+"room full"`. A one-time `WARN "roomN at 90% (n/cap)"` fires per crossing.
+Capacities persist in `config.txt` (backward compatible: old 4-field files load
+fine, capacities default to 30). Peak counts since boot are shown in `rooms` and
+cleared with `resetpeak`.
+
+Room presence is NOT persisted across reboot — every boot clears it and logs
+`CONFIG ... room presence cleared at boot`. Permissions and capacities persist;
+building `inside` flags persist as before in `users.csv`.
+
+Cross-checks (rate-limited once per 60 s per room, real time):
+- PIR motion with `count == 0` → `ALERT "motion in roomN but nobody badged in"`.
+- `count > 0` with no PIR motion for 10 minutes → `INFO "badged but room idle"`.
+Lights still follow PIR only; badge presence does not switch lights.
+
+Commands: `scan roomN in|out <UID>`, `rooms`, `count`, `maxocc`, `resetpeak`.

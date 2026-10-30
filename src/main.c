@@ -8,11 +8,25 @@
  * single-board demonstration; the entrance/room1/room2 environments build the
  * distributed deployment from the same source.
  *
+ * DATA FLOW: Sense -> Decide -> Act -> Record
+ *   Sense    : card scans (serial), PIR motion (GPIO), admin commands, virtual clock
+ *   Decide   : access rules (schedule, anti-passback, lockout), light occupancy (20 s idle)
+ *   Act      : door LEDs, buzzer, room lights, red LED + buzzer alarm
+ *   Record   : access.csv on SD (HH:MM:SS,EVENT,UID,NAME,DETAIL), console lines
+ *
  * SYNCHRONISATION RULES (easy to explain):
  *   1. mtx    = mutex protecting shared data on this ESP32
  *   2. sd_mtx = mutex protecting the SD card files
  *   3. Never take mtx while holding sd_mtx's opposite: order is sd_mtx -> mtx
  *   4. Log lines go through a QUEUE; a single logger task writes them to SD
+ */
+/*
+ * =========================================================================
+ * PART A — Foundation
+ *   Includes, role macros (APP_ROLE), GPIO pins, shared data structures
+ *   (users, rooms, remote_room), mutexes/queues, virtual clock
+ *   (now_s / set_clock / in_window).
+ * =========================================================================
  */
 #include <stdio.h>
 #include <string.h>
@@ -57,8 +71,29 @@ static const int LIGHT[2] = {32, 33};
 /* ---------- shared data ---------- */
 #define MAX_USERS 8
 #define LIGHT_WATTS 40
-typedef struct { char uid[12]; char name[12]; bool inside; } user_t;
+typedef struct { char uid[12]; char name[12]; bool inside;
+                 int8_t current_room;   /* 0 = none, 1 = room1, 2 = room2 */
+                 int32_t entered_at;    /* virtual seconds-of-day of room entry */
+} user_t;
 typedef struct { bool occupied; int64_t last_motion_us; double on_s; } room_t;
+
+/* ---------- room permissions (persisted in rooms.csv) ---------- */
+#define MAXSTAY_DEFAULT_MIN 120
+typedef struct {
+    char uid[12];
+    int8_t room;              /* 1 or 2 */
+    int32_t from_s;           /* allowed window start, seconds of day */
+    int32_t to_s;             /* allowed window end, seconds of day (overnight wrap ok) */
+    int32_t pass_expires;     /* 0 = none, else seconds-of-day pass expiry */
+} room_perm_t;
+static room_perm_t perms[MAX_USERS];
+static int nperms = 0;
+static int maxstay_min __attribute__((unused)) = MAXSTAY_DEFAULT_MIN;
+static int maxocc[2] = { 30, 30 };            /* per-room capacity, default 30 */
+static bool warned90[2] = { false, false };   /* one 90% warning per room per crossing */
+static int peak_count[2] = { 0, 0 };          /* highest count since boot */
+static int32_t peak_at_s[2] = { 0, 0 };       /* virtual seconds-of-day of the peak */
+static bool room_auth_required = false;   /* false = default allow (demo); true once grant/revoke used */
 
 static user_t users[MAX_USERS];
 static int nusers = 0;
@@ -105,6 +140,13 @@ static bool in_window(int s) {            /* is building access allowed at secon
 }
 
 /* ---------- helpers ---------- */
+/*
+ * =========================================================================
+ * PART B — Boot and services
+ *   logev, alarm_req, ESP-NOW receive/init/report, logger_task, alarm_task,
+ *   cli_task, app_main.
+ * =========================================================================
+ */
 static void logev(const char *ev, const char *uid, const char *name, const char *detail) {
     char l[96]; int s = now_s();
     snprintf(l, sizeof l, "%02d:%02d:%02d,%s,%s,%s,%s", s / 3600, s / 60 % 60, s % 60, ev, uid, name, detail);
@@ -170,12 +212,143 @@ static void radio_report_task(void *arg) {
         }
     }
 }
+/*
+ * =========================================================================
+ * PART C — Entrance access control
+ *   find, count_inside, hash_pin, SD storage (sd_init, save_users, save_cfg,
+ *   load_all), gate_task, scan/who/users/log commands.
+ * =========================================================================
+ */
 static user_t *find(const char *uid) {                 /* call with mtx held */
     for (int i = 0; i < nusers; i++) if (!strcmp(users[i].uid, uid)) return &users[i];
     return NULL;
 }
 static int count_inside(void) {                         /* call with mtx held */
     int n = 0; for (int i = 0; i < nusers; i++) n += users[i].inside; return n;
+}
+static int count_in_room(int room) {                    /* call with mtx held */
+    int n = 0; for (int i = 0; i < nusers; i++) if (users[i].current_room == room) n++;
+    return n;
+}
+
+/* Log a single WARN when a room reaches 90% of capacity; clear the flag when it drops back. */
+static void room_check_90(int room) {                   /* call with mtx held */
+    int cap = maxocc[room - 1];
+    if (cap <= 0) return;
+    int n = count_in_room(room);
+    int thr = cap * 90 / 100;
+    if (n >= thr && !warned90[room - 1]) {
+        warned90[room - 1] = true;
+        char d[64]; snprintf(d, sizeof d, "room%d at 90%% (%d/%d)", room, n, cap);
+        logev("WARN", "-", "-", d);
+    }
+    if (n < thr) warned90[room - 1] = false;
+}
+
+/* true if second-of-day now_s lies in [from_s, to_s); supports overnight wrap */
+static bool in_time_window(int from_s, int to_s, int now_s) {
+    if (from_s <= to_s) return (now_s >= from_s && now_s < to_s);
+    return (now_s >= from_s || now_s < to_s);
+}
+
+/* true if the virtual clock has reached/passed a pass expiry (passes < 12 h) */
+static bool pass_is_expired(int now_s, int expiry_s) {
+    int f = (expiry_s - now_s + 86400) % 86400;
+    return f == 0 || f > 12 * 3600;
+}
+
+typedef struct { bool allow; int8_t reason; } room_decision_t;
+/* reason: 0 not in building, 1 no permission, 2 outside allowed time,
+ * 3 pass expired, 4 already in room, 5 room full, 6 not in this room */
+static __attribute__((unused)) room_decision_t decide_room_entry(const user_t *u, int room, bool in_op,
+                                         int now_s, const room_perm_t *perms,
+                                         int nperms, int maxocc, int occupants) {
+    room_decision_t r = { .allow = false, .reason = -1 };
+    if (in_op) {
+        if (!u->inside) { r.reason = 0; return r; }                       /* not in building */
+        if (room_auth_required) {
+            const room_perm_t *p = NULL;
+            for (int i = 0; i < nperms; i++) {
+                if (strcmp(perms[i].uid, u->uid) == 0 && perms[i].room == room) { p = &perms[i]; break; }
+            }
+            if (!p) { r.reason = 1; return r; }                               /* no permission */
+            if (!in_time_window(p->from_s, p->to_s, now_s)) { r.reason = 2; return r; } /* outside allowed time */
+            if (p->pass_expires != 0 && pass_is_expired(now_s, p->pass_expires)) { r.reason = 3; return r; } /* pass expired */
+        }
+        if (u->current_room == room) { r.reason = 4; return r; }          /* already in room */
+        if (maxocc > 0 && occupants >= maxocc) { r.reason = 5; return r; } /* room full */
+        r.allow = true;
+    } else {
+        if (u->current_room != room) { r.reason = 6; return r; }          /* not in this room */
+        r.allow = true;
+    }
+    return r;
+}
+
+static __attribute__((unused)) const char *room_reason_str(int8_t reason) {
+    switch (reason) {
+        case 0: return "not in building";
+        case 1: return "no permission";
+        case 2: return "outside allowed time";
+        case 3: return "pass expired";
+        case 4: return "already in room";
+        case 5: return "room full";
+        case 6: return "not in this room";
+        case 7: return "no link to entrance";
+        default: return "unknown";
+    }
+}
+
+/* Synchronous room in/out decision used by the console (demo) and, later, the radio path.
+ * Caller must hold mtx. Logs ROOM_IN / ROOM_OUT / ROOM_MOVE / ROOM_DENIED. */
+static void room_scan(int room, bool in_op, const char *uid) {
+    user_t *u = find(uid);
+    char rname[16]; snprintf(rname, sizeof rname, "Room%d", room);
+    if (!u) { logev("ROOM_DENIED", uid, "-", "unknown tag"); alarm_req(150);
+              printf("Tag %s: unknown tag\n", uid); return; }
+    int now = now_s();
+    int old_room = u->current_room;
+    int before = count_in_room(room);
+    room_decision_t d = decide_room_entry(u, room, in_op, now, perms, nperms,
+                                          maxocc[room - 1], before);
+    if (!d.allow) {
+        logev("ROOM_DENIED", uid, u->name, room_reason_str(d.reason));
+        alarm_req(150);
+        printf("Tag %s: %s\n", uid, room_reason_str(d.reason));
+        return;
+    }
+    const char *nm = u->name;
+    char detail[128];
+    if (in_op) {
+        if (old_room != 0 && old_room != room) {
+            /* auto-leave previous room */
+            u->current_room = 0; u->entered_at = 0;
+            int after_leave = count_in_room(old_room);
+            u->entered_at = now; u->current_room = (int8_t)room;
+            int after_join = count_in_room(room);
+            if (after_join > peak_count[room - 1]) { peak_count[room - 1] = after_join; peak_at_s[room - 1] = now; }
+            snprintf(detail, sizeof detail, "Room%d count=%d -> Room%d count=%d",
+                     old_room, after_leave, room, after_join);
+            logev("ROOM_MOVE", uid, nm, detail);
+            room_check_90(old_room);
+            room_check_90(room);
+        } else {
+            u->entered_at = now; u->current_room = (int8_t)room;
+            int after = count_in_room(room);
+            if (after > peak_count[room - 1]) { peak_count[room - 1] = after; peak_at_s[room - 1] = now; }
+            snprintf(detail, sizeof detail, "%s count=%d", rname, after);
+            logev("ROOM_IN", uid, nm, detail);
+            room_check_90(room);
+        }
+        printf("Tag %s presented at %s in reader\n", uid, rname);
+    } else {
+        u->current_room = 0; u->entered_at = 0;
+        int after = count_in_room(room);
+        snprintf(detail, sizeof detail, "%s count=%d", rname, after);
+        logev("ROOM_OUT", uid, nm, detail);
+        room_check_90(room);
+        printf("Tag %s presented at %s out reader\n", uid, rname);
+    }
 }
 static void hash_pin(const char *p, char *out) {
     unsigned char h[32]; size_t h_len = 0;
@@ -217,8 +390,44 @@ static void save_cfg(void) {
     if (!sd_ok) return;
     xSemaphoreTake(sd_mtx, portMAX_DELAY);
     FILE *f = fopen("/sdcard/config.txt", "w");
-    if (f) { fprintf(f, "%d %d %d %s\n", open_min, close_min, idle_s, pin_hash); fclose(f); }
+    if (f) { fprintf(f, "%d %d %d %s %d %d\n", open_min, close_min, idle_s, pin_hash, maxocc[0], maxocc[1]); fclose(f); }
     xSemaphoreGive(sd_mtx);
+}
+static __attribute__((unused)) bool save_rooms(void) {            /* persists permissions; lock order sd_mtx -> mtx */
+    if (!sd_ok) return false;
+    xSemaphoreTake(sd_mtx, portMAX_DELAY);
+    xSemaphoreTake(mtx, portMAX_DELAY);
+    FILE *f = fopen("/sdcard/rooms.csv", "w");
+    bool saved = false;
+    if (f) {
+        saved = true;
+        for (int i = 0; i < nperms; i++)
+        fprintf(f, "%s,%d,%d,%d,%d\n", perms[i].uid, (int)perms[i].room,
+                (int)perms[i].from_s, (int)perms[i].to_s, (int)perms[i].pass_expires);
+        fclose(f);
+    }
+    xSemaphoreGive(mtx);
+    xSemaphoreGive(sd_mtx);
+    return saved;
+}
+static void load_rooms(void) {            /* called at boot; no locks needed yet */
+    if (!sd_ok) return;
+    FILE *f = fopen("/sdcard/rooms.csv", "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char uid[12]; int room, from, to, exp;
+        if (sscanf(line, "%11[^,],%d,%d,%d,%d", uid, &room, &from, &to, &exp) == 5 &&
+            nperms < MAX_USERS) {
+            snprintf(perms[nperms].uid, 12, "%s", uid);
+            perms[nperms].room = (int8_t)room;
+            perms[nperms].from_s = from;
+            perms[nperms].to_s = to;
+            perms[nperms].pass_expires = exp;
+            nperms++;
+        }
+    }
+    fclose(f);
 }
 static void add_user(const char *uid, const char *name, bool inside) {   /* mtx held or boot time */
     if (nusers >= MAX_USERS) return;
@@ -229,11 +438,25 @@ static void load_all(void) {
     hash_pin("1234", pin_hash);                          /* default admin PIN */
     if (sd_ok) {
         FILE *f = fopen("/sdcard/config.txt", "r");
-        if (f) { char h[65]; if (fscanf(f, "%d %d %d %64s", &open_min, &close_min, &idle_s, h) == 4) strcpy(pin_hash, h); fclose(f); }
+        if (f) {
+            char h[65];
+            if (fscanf(f, "%d %d %d %64s", &open_min, &close_min, &idle_s, h) == 4) {
+                strcpy(pin_hash, h);
+                int c1, c2;
+                if (fscanf(f, "%d %d", &c1, &c2) == 2) { maxocc[0] = c1; maxocc[1] = c2; }
+            }
+            fclose(f);
+        }
         f = fopen("/sdcard/users.csv", "r");
         if (f) { char u[12], nm[12]; int in; while (fscanf(f, "%11s %11s %d", u, nm, &in) == 3) add_user(u, nm, in); fclose(f); }
     }
     if (nusers == 0) { add_user("A1B2C3D4", "Alice", false); add_user("B2C3D4E5", "Bob", false); add_user("C3D4E5F6", "Carol", false); }
+    load_rooms();                                             /* permissions persist across reboot */
+    /* room presence is not persisted: clear it at boot and note it */
+    xSemaphoreTake(mtx, portMAX_DELAY);
+    for (int i = 0; i < nusers; i++) { users[i].current_room = 0; users[i].entered_at = 0; }
+    xSemaphoreGive(mtx);
+    logev("CONFIG", "-", "system", "room presence cleared at boot");
 }
 
 /* ---------- tasks ---------- */
@@ -269,6 +492,7 @@ static void gate_task(void *arg) {
         int64_t t = esp_timer_get_time();
         if (t < lock_until) { logev("DENIED", uid, "-", "gate locked after repeated failures"); continue; }
         const char *why = NULL; char name[12] = "-"; bool ok = false; int inside;
+        int leaving_room = 0;
         xSemaphoreTake(mtx, portMAX_DELAY);
         user_t *u = find(uid);
         if (!u) why = "unknown tag";
@@ -285,8 +509,16 @@ static void gate_task(void *arg) {
                 else { u->inside = false; ok = true; }
             }
         }
+        if (u && ok && dir == 1 && u->current_room != 0) {   /* leaving building while in a room */
+            leaving_room = u->current_room;
+            u->current_room = 0; u->entered_at = 0;
+        }
         inside = count_inside();
         xSemaphoreGive(mtx);
+        if (leaving_room) {
+            char rn[16]; snprintf(rn, sizeof rn, "Room%d", leaving_room);
+            logev("ROOM_OUT", uid, name, "auto: left building");
+        }
         if (ok) {
             char d[24]; snprintf(d, sizeof d, "inside=%d", inside);
             logev(tag, uid, name, d); save_users(); fails = 0;
@@ -304,12 +536,21 @@ static void gate_task(void *arg) {
     }
 }
 /* Room terminal: PIR -> light, with idle timeout, energy counter, intruder alert */
+/*
+ * =========================================================================
+ * PART D — Rooms and radio
+ *   room_task (PIR/light/heartbeat/intruder alert), show_status, motion
+ *   command. ESP-NOW receive/init/report live in Part B region.
+ * =========================================================================
+ */
 static void room_task(void *arg) {
     int r = (int)(intptr_t)arg;
     const char *nm = r == 0 ? "ROOM1" : "ROOM2";
     bool light = false, prev_occ = false, pir_armed = false;
     uint8_t sequence = 0;
     int64_t last_report_us = 0;
+    int64_t last_alert_us = 0, last_info_us = 0;
+    const char *rlabel = r == 0 ? "room1" : "room2";
     for (;;) {
         int64_t t = esp_timer_get_time();
         xSemaphoreTake(mtx, portMAX_DELAY);
@@ -317,12 +558,22 @@ static void room_task(void *arg) {
         if (!pir_level) pir_armed = true;
         else if (pir_armed) room[r].last_motion_us = t;
         bool occ = (t - room[r].last_motion_us) < (int64_t)idle_s * 1000000LL;
-        bool intruder = APP_ROLE == ROLE_DEMO && occ && !prev_occ && count_inside() == 0;
+        int cnt = count_in_room(r + 1);
+        bool motion_alert = occ && !prev_occ && cnt == 0;
+        bool idle_info = cnt > 0 && (t - room[r].last_motion_us) >= (int64_t)600 * 1000000LL;
         room[r].occupied = occ; if (occ) room[r].on_s += 0.2;
         xSemaphoreGive(mtx);
         gpio_set_level(LIGHT[r], occ);
         if (occ != light) { light = occ; logev(occ ? "LIGHT_ON" : "LIGHT_OFF", "-", nm, occ ? "motion" : "room empty"); }
-        if (intruder) { logev("ALERT", "-", nm, "motion but nobody badged in"); alarm_req(3000); }
+        if (motion_alert && (t - last_alert_us >= (int64_t)60 * 1000000LL)) {
+            last_alert_us = t;
+            char d[64]; snprintf(d, sizeof d, "motion in %s but nobody badged in", rlabel);
+            logev("ALERT", "-", nm, d); alarm_req(3000);
+        }
+        if (idle_info && (t - last_info_us >= (int64_t)60 * 1000000LL)) {
+            last_info_us = t;
+            logev("INFO", "-", nm, "badged but room idle");
+        }
         if ((APP_ROLE == ROLE_ROOM1 || APP_ROLE == ROLE_ROOM2) &&
             (occ != prev_occ || t - last_report_us >= 5000000LL)) {
             room_report_t report = { .version = 1, .room_id = (uint8_t)(r + 1),
@@ -349,6 +600,14 @@ static void sched_task(void *a) {                         /* announces open/clos
 }
 
 /* ---------- serial menu ---------- */
+/*
+ * =========================================================================
+ * PART E — Admin security and console
+ *   hash_pin, is_admin, show_help, exec, cli_task, app_main and the
+ *   clearinside/login/logout/schedule/adduser/deluser/evac/passwd/settime/
+ *   speed commands.
+ * =========================================================================
+ */
 static bool is_admin(void) {
     int64_t t = esp_timer_get_time();
     if (admin && t < admin_until) { admin_until = t + 60000000LL; return true; }   /* 60 s idle timeout */
@@ -358,7 +617,32 @@ static int parse_hm(const char *s) {
     int h, m; if (sscanf(s, "%d:%d", &h, &m) != 2 || h < 0 || h > 23 || m < 0 || m > 59) return -1; return h * 60 + m;
 }
 static void up(char *s) { for (; *s; s++) *s = toupper((unsigned char)*s); }
+static int iequals(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return 0;
+    return *a == *b;
+}
 #define NEED_ADMIN if (!is_admin()) { puts("DENIED: admin only. Use: login <pin>"); return; }
+
+static void show_rooms(void) {                              /* who is badged into each room */
+    xSemaphoreTake(mtx, portMAX_DELAY);
+    for (int i = 0; i < 2; i++) {
+        const char *nm = i == 0 ? "Room1" : "Room2";
+        int n = count_in_room(i + 1);
+        bool occ = room[i].occupied;
+        if (n == 0) { printf("%s: 0 inside | cap %d | peak %d | PIR: %s | light %s\n", nm, maxocc[i], peak_count[i], occ ? "motion" : "idle", occ ? "ON" : "OFF"); continue; }
+        printf("%s: %d inside (", nm, n);
+        int shown = 0;
+        for (int j = 0; j < nusers && shown < 6; j++) {
+            if (users[j].current_room != i + 1) continue;
+            if (shown) printf(", ");
+            printf("%s", users[j].name);
+            shown++;
+        }
+        if (n > shown) printf(" ...and %d more", n - shown);
+        printf(") | cap %d | peak %d | PIR: %s | light %s\n", maxocc[i], peak_count[i], occ ? "motion" : "idle", occ ? "ON" : "OFF");
+    }
+    xSemaphoreGive(mtx);
+}
 
 static void show_status(void) {
     int s = now_s(); char sp[16];
@@ -385,6 +669,15 @@ static void show_status(void) {
                    room[i].occupied ? "OCCUPIED" : "vacant",
                    room[i].occupied ? "ON" : "OFF");
     }
+    if (APP_ROLE == ROLE_ENTRANCE || APP_ROLE == ROLE_DEMO) {
+        for (int i = 0; i < 2; i++) {
+            int n = count_in_room(i + 1);
+            printf("Room%d: %d badged", i + 1, n);
+            for (int j = 0; j < nusers; j++)
+                if (users[j].current_room == i + 1) printf(" %s", users[j].name);
+            puts("");
+        }
+    }
     printf("Energy: used %.2f Wh, saved %.2f Wh vs lights always on\n", used, base > used ? base - used : 0);
     xSemaphoreGive(mtx);
 }
@@ -393,25 +686,56 @@ static void show_help(void) {
          " status | who | users | log [n]        view system info\n"
          " scan in|out <UID>                     present RFID tag at a door\n"
          " motion 1|2                            simulate PIR motion in a room\n"
+         " count                                 building / per-room badge counts\n"
          " login <pin> | logout                  admin session (default PIN 1234)\n"
+         "--- ROOM READERS ---\n"
+         " scan room1|room2 in|out <UID>         present tag at a room reader\n"
+         " scan room 1|2 in|out <UID>            same, with a space before the room number\n"
+         " rooms                                 who is badged into each room, count, cap, peak, PIR state\n"
          "--- ADMIN ---\n"
          " schedule HH:MM HH:MM                  set building open/close time\n"
          " adduser <UID> <name> | deluser <UID>  manage tags\n"
          " clearinside                           clear saved badge-ins (building confirmed empty)\n"
          " evac on|off                           emergency: allow exit anytime\n"
          " passwd <newpin>                       change admin PIN\n"
-         " settime HH:MM | speed <1-600>         demo clock tools");
+         " settime HH:MM | speed <1-600>         demo clock tools\n"
+         " maxocc <room> <n>                     room capacity (default 30)\n"
+         " resetpeak                             reset per-room peak counts\n"
+         " grant / revoke / pass / maxstay       room permissions (implemented next phase)");
 }
 static void exec(char *line) {
-    char *av[4]; int ac = 0;
-    for (char *p = strtok(line, " "); p && ac < 4; p = strtok(NULL, " ")) av[ac++] = p;
+    char *av[8]; int ac = 0;
+    for (char *p = strtok(line, " "); p && ac < 8; p = strtok(NULL, " ")) av[ac++] = p;
     if (!ac) return;
     const char *c = av[0];
     if (!strcmp(c, "help")) show_help();
     else if (!strcmp(c, "status")) show_status();
-    else if (!strcmp(c, "scan") && ac == 3 && (!strcmp(av[1], "in") || !strcmp(av[1], "out"))) {
-        up(av[2]); char uid[12]; snprintf(uid, sizeof uid, "%s", av[2]);
-        xQueueSend(gate_q[!strcmp(av[1], "out")], uid, 0); printf("Tag %s presented at %s reader\n", uid, av[1]);
+    else if (!strcmp(c, "scan")) {
+        if (ac < 3) { puts("Usage: scan in|out <UID>   or   scan room1|room2 in|out <UID>"); return; }
+        if (iequals(av[1], "in") || iequals(av[1], "out")) {
+            if (ac != 3) { puts("Usage: scan in|out <UID>"); return; }
+            up(av[2]); char uid[12]; snprintf(uid, sizeof uid, "%s", av[2]);
+            xQueueSend(gate_q[!strcmp(av[1], "out")], uid, 0); printf("Tag %s presented at %s reader\n", uid, av[1]);
+            return;
+        }
+        int room = -1, uid_index = -1; bool in_op = false;
+        if (iequals(av[1], "room1")) { room = 1; uid_index = 3; }
+        else if (iequals(av[1], "room2")) { room = 2; uid_index = 3; }
+        else if (iequals(av[1], "room") && ac >= 5 &&
+                 (iequals(av[2], "1") || iequals(av[2], "2"))) {
+            room = av[2][0] - '0'; uid_index = 4;
+        }
+        if (room == -1 || uid_index < 0 || ac != uid_index + 1) {
+            puts("Usage: scan room1|room2 in|out <UID>"); return;
+        }
+        if (iequals(av[uid_index - 1], "in")) in_op = true;
+        else if (iequals(av[uid_index - 1], "out")) in_op = false;
+        else { puts("Usage: scan room1|room2 in|out <UID>"); return; }
+        up(av[uid_index]); char uid[12]; snprintf(uid, sizeof uid, "%s", av[uid_index]);
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        room_scan(room, in_op, uid);
+        xSemaphoreGive(mtx);
+        return;
     }
     else if (!strcmp(c, "motion") && ac == 2 && (av[1][0] == '1' || av[1][0] == '2')) {
         xSemaphoreTake(mtx, portMAX_DELAY); room[av[1][0] - '1'].last_motion_us = esp_timer_get_time(); xSemaphoreGive(mtx);
@@ -420,31 +744,45 @@ static void exec(char *line) {
     else if (!strcmp(c, "who")) {
         xSemaphoreTake(mtx, portMAX_DELAY);
         printf("Inside now (%d):", count_inside());
-        for (int i = 0; i < nusers; i++) if (users[i].inside) printf(" %s", users[i].name);
+        for (int i = 0; i < nusers; i++) if (users[i].inside) {
+            printf(" %s", users[i].name);
+            if (users[i].current_room) printf("(Room%d)", users[i].current_room);
+        }
         puts(""); xSemaphoreGive(mtx);
     }
     else if (!strcmp(c, "users")) {
         xSemaphoreTake(mtx, portMAX_DELAY);
-        for (int i = 0; i < nusers; i++) printf("%s  %-10s %s\n", users[i].uid, users[i].name, users[i].inside ? "inside" : "outside");
+        for (int i = 0; i < nusers; i++) {
+            printf("%s  %-10s %s", users[i].uid, users[i].name, users[i].inside ? "inside" : "outside");
+            if (users[i].current_room) printf("   Room%d", users[i].current_room); else printf("   -");
+            puts("");
+        }
+        xSemaphoreGive(mtx);
+    }
+    else if (!strcmp(c, "rooms")) { show_rooms(); }
+    else if (!strcmp(c, "count")) {
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        int inside = count_inside();
+        int r1 = count_in_room(1), r2 = count_in_room(2);
+        printf("Building: %d inside / %d registered | Room1: %d | Room2: %d | not in a room: %d\n",
+               inside, nusers, r1, r2, inside - r1 - r2);
         xSemaphoreGive(mtx);
     }
     else if (!strcmp(c, "clearinside") && ac == 1) {
         NEED_ADMIN
         xSemaphoreTake(mtx, portMAX_DELAY);
-        int cleared = 0;
+        int cleared = 0, room_cleared = 0;
         for (int i = 0; i < nusers; i++) {
-            if (users[i].inside) {
-                users[i].inside = false;
-                cleared++;
-            }
+            if (users[i].inside) { users[i].inside = false; cleared++; }
+            if (users[i].current_room != 0) { users[i].current_room = 0; users[i].entered_at = 0; room_cleared++; }
         }
         xSemaphoreGive(mtx);
         bool saved = save_users();
-        char detail[24]; snprintf(detail, sizeof detail, "cleared=%d", cleared);
+        char detail[32]; snprintf(detail, sizeof detail, "cleared=%d rooms=%d", cleared, room_cleared);
         logev("INSIDE_RESET", "-", "admin", detail);
-        if (saved) printf("Cleared %d badged occupant(s); state saved\n", cleared);
-        else if (!sd_ok) printf("Cleared %d badged occupant(s) in memory; SD unavailable, not saved\n", cleared);
-        else printf("Cleared %d badged occupant(s) in memory; ERROR: could not save state to SD\n", cleared);
+        if (saved) printf("Cleared %d badged occupant(s), %d room presence(s); state saved\n", cleared, room_cleared);
+        else if (!sd_ok) printf("Cleared %d badged occupant(s), %d room presence(s) in memory; SD unavailable\n", cleared, room_cleared);
+        else printf("Cleared %d badged occupant(s), %d room presence(s) in memory; ERROR: could not save state\n", cleared, room_cleared);
     }
     else if (!strcmp(c, "log")) {
         if (!sd_ok) { puts("SD card not available"); return; }
@@ -484,7 +822,19 @@ static void exec(char *line) {
     else if (!strcmp(c, "deluser") && ac == 2) {
         NEED_ADMIN
         up(av[1]); xSemaphoreTake(mtx, portMAX_DELAY); user_t *u = find(av[1]);
-        if (u) { *u = users[--nusers]; puts("User removed"); } else puts("No such tag");
+        if (u) {
+            char rmuid[12], rmname[12]; int in_room = u->current_room;
+            snprintf(rmuid, sizeof rmuid, "%s", u->uid); snprintf(rmname, sizeof rmname, "%s", u->name);
+            if (in_room != 0) {
+                *u = users[--nusers];
+                int after = count_in_room(in_room);
+                char detail[128]; snprintf(detail, sizeof detail, "Room%d count=%d (removed)", in_room, after);
+                logev("ROOM_OUT", rmuid, rmname, detail);
+            } else {
+                *u = users[--nusers];
+            }
+            puts("User removed");
+        } else puts("No such tag");
         xSemaphoreGive(mtx); save_users(); logev("CONFIG", av[1], "-", "user removed");
     }
     else if (!strcmp(c, "evac") && ac == 2) {
@@ -495,12 +845,35 @@ static void exec(char *line) {
     else if (!strcmp(c, "settime") && ac == 2) {
         NEED_ADMIN
         int m = parse_hm(av[1]); if (m < 0) { puts("Use HH:MM"); return; }
-        set_clock(m * 60, speed); puts("Time set");
+        set_clock(m * 60, speed);
+        /* clock jump: room presence entries are no longer time-valid */
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        for (int i = 0; i < nusers; i++) {
+            if (users[i].current_room) { users[i].current_room = 0; users[i].entered_at = 0; }
+        }
+        xSemaphoreGive(mtx);
+        logev("CONFIG", "-", "system", "room presence cleared on clock jump");
+        puts("Time set");
     }
     else if (!strcmp(c, "speed") && ac == 2) {
         NEED_ADMIN
         int v = atoi(av[1]); if (v < 1 || v > 600) { puts("1-600"); return; }
         set_clock(now_s(), v); printf("Clock speed x%d\n", v);
+    }
+    else if (!strcmp(c, "maxocc") && ac == 3) {
+        NEED_ADMIN
+        int room = atoi(av[1]); int n = atoi(av[2]);
+        if (room < 1 || room > 2 || n < 1 || n > MAX_USERS) { puts("Use: maxocc 1|2 <1-500>"); return; }
+        xSemaphoreTake(mtx, portMAX_DELAY); maxocc[room - 1] = n; xSemaphoreGive(mtx);
+        save_cfg(); char d[24]; snprintf(d, sizeof d, "room%d=%d", room, n); logev("CONFIG", "-", "maxocc", d);
+        printf("Room%d capacity set to %d\n", room, n);
+    }
+    else if (!strcmp(c, "resetpeak") && ac == 1) {
+        NEED_ADMIN
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        peak_count[0] = peak_count[1] = 0; peak_at_s[0] = peak_at_s[1] = 0;
+        xSemaphoreGive(mtx);
+        logev("CONFIG", "-", "admin", "peaks reset"); puts("Peaks reset");
     }
     else puts("Unknown command. Type: help");
 }
