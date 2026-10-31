@@ -1,33 +1,4 @@
-/*
- * CoCIS Smart Control & Monitoring System  (ESP32 + ESP-IDF, simulated in Wokwi)
- *
- * Three-board deployment (selected with APP_ROLE in platformio.ini):
- *   Entrance : gate_task(IN/OUT), schedule, admin CLI, SD logger, ESP-NOW hub
- *   Room 1/2 : local PIR/light control and five-second ESP-NOW heartbeats
- * The default Wokwi build combines all three roles on one ESP32 for a simple
- * single-board demonstration; the entrance/room1/room2 environments build the
- * distributed deployment from the same source.
- *
- * DATA FLOW: Sense -> Decide -> Act -> Record
- *   Sense    : card scans (serial), PIR motion (GPIO), admin commands, virtual clock
- *   Decide   : access rules (schedule, anti-passback, lockout), light occupancy (20 s idle)
- *   Act      : door LEDs, buzzer, room lights, red LED + buzzer alarm
- *   Record   : access.csv on SD (HH:MM:SS,EVENT,UID,NAME,DETAIL), console lines
- *
- * SYNCHRONISATION RULES (easy to explain):
- *   1. mtx    = mutex protecting shared data on this ESP32
- *   2. sd_mtx = mutex protecting the SD card files
- *   3. Never take mtx while holding sd_mtx's opposite: order is sd_mtx -> mtx
- *   4. Log lines go through a QUEUE; a single logger task writes them to SD
- */
-/*
- * =========================================================================
- * PART A — Foundation
- *   Includes, role macros (APP_ROLE), GPIO pins, shared data structures
- *   (users, rooms, remote_room), mutexes/queues, virtual clock
- *   (now_s / set_clock / in_window).
- * =========================================================================
- */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -60,7 +31,7 @@
 #define APP_ROLE ROLE_DEMO
 #endif
 
-/* ---------- pins ---------- */
+
 #define PIN_DOOR_IN 25
 #define PIN_DOOR_OUT 26
 #define PIN_RED 27
@@ -68,7 +39,7 @@
 static const int PIR[2]   = {34, 35};
 static const int LIGHT[2] = {32, 33};
 
-/* ---------- shared data ---------- */
+
 #define MAX_USERS 8
 #define LIGHT_WATTS 40
 typedef struct { char uid[12]; char name[12]; bool inside;
@@ -77,7 +48,7 @@ typedef struct { char uid[12]; char name[12]; bool inside;
 } user_t;
 typedef struct { bool occupied; int64_t last_motion_us; double on_s; } room_t;
 
-/* ---------- room permissions (persisted in rooms.csv) ---------- */
+
 #define MAXSTAY_DEFAULT_MIN 120
 typedef struct {
     char uid[12];
