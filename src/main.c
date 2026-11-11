@@ -1,3 +1,4 @@
+
 /*
  * CoCIS Smart Control & Monitoring System  (ESP32 + ESP-IDF, simulated in Wokwi)
  *
@@ -63,7 +64,7 @@
 #define APP_ROLE ROLE_DEMO
 #endif
 
-/* ---------- pins ---------- */
+
 #define PIN_DOOR_IN 25
 #define PIN_DOOR_OUT 26
 #define PIN_RED 27
@@ -77,7 +78,7 @@
 static const int PIR[2]   = {34, 35};
 static const int LIGHT[2] = {32, 33};
 
-/* ---------- shared data ---------- */
+
 #define MAX_USERS 8
 #define LIGHT_WATTS 40
 typedef struct { char uid[12]; char name[12]; bool inside;
@@ -86,7 +87,7 @@ typedef struct { char uid[12]; char name[12]; bool inside;
 } user_t;
 typedef struct { bool occupied; int64_t last_motion_us; double on_s; } room_t;
 
-/* ---------- room permissions (persisted in rooms.csv) ---------- */
+
 #define MAXSTAY_DEFAULT_MIN 120
 typedef struct {
     char uid[12];
