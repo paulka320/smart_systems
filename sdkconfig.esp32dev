@@ -3473,6 +3473,13 @@ CONFIG_WL_SECTOR_SIZE_4096=y
 # default:
 CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
+
+#
+# RC522
+#
+# default:
+CONFIG_RC522_PREVENT_SECTOR_TRAILER_WRITE=y
+# end of RC522
 # end of Component config
 
 # default:

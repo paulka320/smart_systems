@@ -1,0 +1,3 @@
+dependencies:
+  abobija/rc522:
+    version: '*'
