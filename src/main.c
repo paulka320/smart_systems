@@ -9,7 +9,7 @@
  * distributed deployment from the same source.
  *
  * DATA FLOW: Sense -> Decide -> Act -> Record
- *   Sense    : card scans (serial), PIR motion (GPIO), admin commands, virtual clock
+ *   Sense    : RFID card scans (MFRC522), PIR motion (GPIO), admin commands, virtual clock
  *   Decide   : access rules (schedule, anti-passback, lockout), light occupancy (20 s idle)
  *   Act      : door LEDs, buzzer, room lights, red LED + buzzer alarm
  *   Record   : access.csv on SD (HH:MM:SS,EVENT,UID,NAME,DETAIL), console lines
@@ -41,6 +41,9 @@
 #include "driver/uart.h"
 #include "driver/ledc.h"
 #include "driver/spi_common.h"
+#include "rc522.h"
+#include "rc522_picc.h"
+#include "driver/rc522_spi.h"
 #include "driver/sdspi_host.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
@@ -65,6 +68,12 @@
 #define PIN_DOOR_OUT 26
 #define PIN_RED 27
 #define PIN_BUZZ 14
+
+/* Two MFRC522 readers share the SPI bus with the microSD card. */
+#define RFID_ENTRY_CS 16
+#define RFID_ENTRY_RST 22
+#define RFID_EXIT_CS 17
+#define RFID_EXIT_RST 21
 static const int PIR[2]   = {34, 35};
 static const int LIGHT[2] = {32, 33};
 
@@ -104,6 +113,10 @@ static bool evac = false, sd_ok = false;
 
 static SemaphoreHandle_t mtx, sd_mtx;
 static QueueHandle_t log_q, gate_q[2], alarm_q;
+static bool spi_bus_ready = false;
+static spi_host_device_t shared_spi_host;
+static rc522_driver_handle_t rfid_driver[2];
+static rc522_handle_t rfid_scanner[2];
 
 typedef struct {
     uint8_t version;
@@ -367,11 +380,101 @@ static bool sd_init(void) {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     spi_bus_config_t bus = { .mosi_io_num = 23, .miso_io_num = 19, .sclk_io_num = 18,
                              .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4000 };
-    if (spi_bus_initialize(host.slot, &bus, SDSPI_DEFAULT_DMA) != ESP_OK) return false;
+    shared_spi_host = host.slot;
+    if (spi_bus_initialize(host.slot, &bus, SDSPI_DEFAULT_DMA) != ESP_OK) {
+        printf("SPI bus initialisation failed\n");
+        return false;
+    }
+    /* Keep this true even if the SD card itself is absent: the RFID readers
+       can still use the SPI bus. */
+    spi_bus_ready = true;
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.gpio_cs = 5; slot.host_id = host.slot;
     sdmmc_card_t *card;
     return esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mc, &card) == ESP_OK;
+}
+
+/* ---------- MFRC522 RFID readers ---------- */
+static void rfid_card_event(void *arg, esp_event_base_t base, int32_t event_id, void *data) {
+    (void)base;
+    (void)event_id;
+    int dir = (int)(intptr_t)arg;       /* 0 = entrance, 1 = exit */
+    rc522_picc_state_changed_event_t *event = (rc522_picc_state_changed_event_t *)data;
+    if (!event || !event->picc || event->picc->state != RC522_PICC_STATE_ACTIVE) return;
+
+    rc522_picc_t *picc = event->picc;
+    /* This project's existing user table stores 4-byte UIDs as 8 hex chars. */
+    if (picc->uid.length != 4) {
+        printf("[RFID %s] Unsupported UID length: %u bytes (expected 4)\n",
+               dir ? "EXIT" : "ENTRY", (unsigned)picc->uid.length);
+        return;
+    }
+
+    char uid[12];
+    for (int i = 0; i < 4; i++)
+        snprintf(uid + (i * 2), sizeof(uid) - (i * 2), "%02X", picc->uid.value[i]);
+    uid[8] = '\0';
+
+    printf("[RFID %s] Card detected: %s\n", dir ? "EXIT" : "ENTRY", uid);
+    if (xQueueSend(gate_q[dir], uid, 0) != pdTRUE)
+        printf("[RFID %s] Gate queue full; scan was not processed\n", dir ? "EXIT" : "ENTRY");
+}
+
+static bool rfid_init(void) {
+    if (!spi_bus_ready) {
+        printf("RFID unavailable: shared SPI bus was not initialised\n");
+        return false;
+    }
+
+    /* radio_init() creates this in distributed builds; the demo build does not. */
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        printf("RFID event-loop initialisation failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+
+    const int cs_pins[2] = { RFID_ENTRY_CS, RFID_EXIT_CS };
+    const int rst_pins[2] = { RFID_ENTRY_RST, RFID_EXIT_RST };
+    for (int dir = 0; dir < 2; dir++) {
+        /* bus_config=NULL attaches another SPI device to the already-running
+           SPI bus created by sd_init(); each reader has its own chip-select. */
+        rc522_spi_config_t driver_cfg = {
+            .host_id = shared_spi_host,
+            .bus_config = NULL,
+            .dev_config = { .spics_io_num = cs_pins[dir] },
+            .rst_io_num = rst_pins[dir],
+        };
+        err = rc522_spi_create(&driver_cfg, &rfid_driver[dir]);
+        if (err != ESP_OK) {
+            printf("RFID %s SPI setup failed: %s\n", dir ? "EXIT" : "ENTRY", esp_err_to_name(err));
+            return false;
+        }
+        err = rc522_driver_install(rfid_driver[dir]);
+        if (err != ESP_OK) {
+            printf("RFID %s driver install failed: %s\n", dir ? "EXIT" : "ENTRY", esp_err_to_name(err));
+            return false;
+        }
+        rc522_config_t scanner_cfg = { .driver = rfid_driver[dir] };
+        err = rc522_create(&scanner_cfg, &rfid_scanner[dir]);
+        if (err != ESP_OK) {
+            printf("RFID %s scanner creation failed: %s\n", dir ? "EXIT" : "ENTRY", esp_err_to_name(err));
+            return false;
+        }
+        err = rc522_register_events(rfid_scanner[dir], RC522_EVENT_PICC_STATE_CHANGED,
+                                    rfid_card_event, (void *)(intptr_t)dir);
+        if (err != ESP_OK) {
+            printf("RFID %s event registration failed: %s\n", dir ? "EXIT" : "ENTRY", esp_err_to_name(err));
+            return false;
+        }
+        err = rc522_start(rfid_scanner[dir]);
+        if (err != ESP_OK) {
+            printf("RFID %s start failed: %s\n", dir ? "EXIT" : "ENTRY", esp_err_to_name(err));
+            return false;
+        }
+        printf("RFID %s reader ready (CS GPIO%d, RST GPIO%d)\n",
+               dir ? "EXIT" : "ENTRY", cs_pins[dir], rst_pins[dir]);
+    }
+    return true;
 }
 static bool save_users(void) {          /* writes who-is-inside so it survives a reboot */
     if (!sd_ok) return false;
@@ -450,7 +553,7 @@ static void load_all(void) {
         f = fopen("/sdcard/users.csv", "r");
         if (f) { char u[12], nm[12]; int in; while (fscanf(f, "%11s %11s %d", u, nm, &in) == 3) add_user(u, nm, in); fclose(f); }
     }
-    if (nusers == 0) { add_user("A1B2C3D4", "Alice", false); add_user("B2C3D4E5", "Bob", false); add_user("C3D4E5F6", "Carol", false); }
+    if (nusers == 0) { add_user("01020304", "Alice", false); add_user("11223344", "Bob", false); add_user("55667788", "Carol", false); }
     load_rooms();                                             /* permissions persist across reboot */
     /* room presence is not persisted: clear it at boot and note it */
     xSemaphoreTake(mtx, portMAX_DELAY);
@@ -684,7 +787,8 @@ static void show_status(void) {
 static void show_help(void) {
     puts("--- PUBLIC ---\n"
          " status | who | users | log [n]        view system info\n"
-         " scan in|out <UID>                     present RFID tag at a door\n"
+         " scan in|out <UID>                     TEST ONLY: inject a UID through serial\n"
+         " Physical cards are read by the ENTRY and EXIT MFRC522 readers.\n"
          " motion 1|2                            simulate PIR motion in a room\n"
          " count                                 building / per-room badge counts\n"
          " login <pin> | logout                  admin session (default PIN 1234)\n"
@@ -945,6 +1049,8 @@ void app_main(void) {
         printf("SD card: %s\n", sd_ok ? "mounted" : "NOT FOUND (running without storage)");
         load_all();
         ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
+        bool rfid_ok = rfid_init();
+        printf("RFID subsystem: %s\n", rfid_ok ? "READY (physical card scans enabled)" : "NOT READY");
     }
 
     if (!demo) {
